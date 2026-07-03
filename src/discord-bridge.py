@@ -4318,6 +4318,12 @@ def _task_source(task_id: str):
     return None
 
 
+def _dm_fallback_eligible(task_id: str) -> bool:
+    """FAIL-CLOSED (#1854 follow-up): missing/unreadable source -> NOT
+    DM-eligible; a wrongly-skipped result still surfaces via retention."""
+    return _task_source(task_id) in DM_FALLBACK_SOURCES
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -4355,14 +4361,10 @@ async def poll_dm_fallback():
                 # it for its own consumer (+ the retention sweep) to drain. The
                 # other FALLBACK_PREFIXES (question-/briefing-/insight-/friction-)
                 # are cron/proactive artifacts with no channel, so they bypass
-                # this gate and stay eligible. A missing source field is treated
-                # as eligible to preserve the original never-silently-lose-a-
-                # result posture; every current task writer sets the field, so
-                # in practice only voice/phone reach the DM path.
-                if task_id.startswith("task-"):
-                    _src = _task_source(task_id)
-                    if _src is not None and _src not in DM_FALLBACK_SOURCES:
-                        continue
+                # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
+                # source is NOT eligible (see _dm_fallback_eligible).
+                if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
+                    continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
                     st = f.stat()
