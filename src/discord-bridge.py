@@ -2323,6 +2323,30 @@ async def on_message_edit(before, after):
     await _handle_discord_message(after, force=True)
 
 
+def _write_task_file(task_file: Path, content, username: str,
+                     channel_name: str, access_tier: str, message_id: int) -> bool:
+    """Write a task file with diagnostic instrumentation. Returns True on success.
+
+    ``content`` may be a ready string or a zero-arg callable returning the
+    string. Callers pass a callable so the f-string CONSTRUCTION runs inside
+    this try — a build failure (bad attribute access, encoding error) is then
+    logged as a FAILED line instead of silently losing the message before the
+    instrumentation is reached.
+    """
+    try:
+        if callable(content):
+            content = content()
+        task_file.write_text(content)
+    except Exception as _tw_exc:
+        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
+              f"(tier={access_tier}, msg={message_id}): "
+              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+        return False
+    print(f"  [task-write] wrote {task_file.name} "
+          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
+    return True
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3218,8 +3242,12 @@ async def _handle_discord_message(message, force=False):
     # would otherwise lose the message with no trace). Log the outcome either way
     # — a future drop now self-diagnoses: absence of BOTH this line and an
     # early-return log pinpoints a new path; a FAILED line pinpoints the write.
-    try:
-        task_file.write_text(
+    def _build_task_content() -> str:
+        # Deliberately a callable: _write_task_file() invokes it INSIDE its
+        # try, so a failure in this f-string build is logged as a FAILED
+        # line (see the instrumentation note above) instead of raising
+        # before the logging is reached.
+        return (
             f"id: {task_id}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"source: discord\n"
@@ -3237,13 +3265,10 @@ async def _handle_discord_message(message, force=False):
             f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
             f"{discord_skill_hints}"
         )
-    except Exception as _tw_exc:
-        print(f"  [task-write] FAILED for @{username} in #{channel_name} "
-              f"(tier={access_tier}, msg={message.id}): "
-              f"{type(_tw_exc).__name__}: {_tw_exc}", flush=True)
+
+    if not _write_task_file(task_file, _build_task_content, username, channel_name,
+                            access_tier, message.id):
         return
-    print(f"  [task-write] wrote {task_file.name} "
-          f"(@{username}, #{channel_name}, tier={access_tier})", flush=True)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     # Observability: one inbound accepted-message event.
