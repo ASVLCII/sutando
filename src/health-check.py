@@ -22,6 +22,7 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import socket
@@ -1733,6 +1734,48 @@ def apply_skill_symlink_fixes(checks: list) -> None:
             print(f"  {c['name']}: {result['detail']}")
 
 
+def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
+    """Top-level task files that have not produced or archived a result."""
+    if results_dir is None:
+        results_dir = tasks_dir.parent / "results"
+    try:
+        archive_dir = results_dir / "archive"
+        archived_names = set()
+        for path in archive_dir.glob("*/*.txt"):
+            if path.is_file():
+                archived_names.add(path.name)
+        for path in archive_dir.glob("*.txt"):
+            if not path.is_file():
+                continue
+            archived_names.add(path.name)
+            renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
+            if renamed:
+                archived_names.add(f"{renamed.group(1)}.txt")
+        return [
+            path for path in tasks_dir.glob("*.txt")
+            if path.is_file()
+            and not (results_dir / path.name).is_file()
+            and path.name not in archived_names
+        ]
+    except OSError:
+        return []
+
+
+def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | None") -> bool:
+    """Whether log content can describe the currently running bridge.
+
+    A bridge restarted under tmux may write to its pane while the prior
+    startup-managed log remains on disk. Old LoginFailure text must not
+    override a live, newly authenticated process.
+    """
+    if process_started_at is None:
+        return True
+    try:
+        return log_file.stat().st_mtime >= process_started_at - 1
+    except OSError:
+        return True
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
     """Detect a task-queue pileup — tasks/ directory growing without
     being drained. Independent of which watcher / loop is dying: the queue
@@ -1746,7 +1789,7 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
         return {"name": name, "status": "ok", "detail": "tasks/ not yet created"}
     # *.txt at the top level only — archive lives in tasks/archive/<YYYY-MM>/
     # (PR #591) and shouldn't count toward the queue.
-    files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
+    files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
@@ -2297,6 +2340,7 @@ def run_all_checks() -> list[dict]:
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
         # not in effect because nobody restarted the bridge after merge).
+        proc_start = None
         try:
             src_file = REPO_DIR / "src" / f"{name}.py"
             if src_file.exists() and pids:
@@ -2358,7 +2402,14 @@ def run_all_checks() -> list[dict]:
             pass
 
         # Check 6: Log-content health for known failure modes.
-        if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
+        # discord-bridge: LoginFailure means the token is revoked/invalid.
+        #   Always overrides — there is no point restarting with stale code
+        #   if the token is bad; the token fix is the only path forward.
+        # slack-bridge: "60s elapsed" hint means Socket Mode connected but
+        #   events aren't routing (Slack app Event Subscriptions disabled).
+        #   Only overrides "ok" — stale/dead-inode are higher priority.
+        if (log_file.exists() and name in ("discord-bridge", "slack-bridge")
+                and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
                 override = bridge_log_content_status(name, status, tail)
@@ -2907,10 +2958,7 @@ def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple
     backlog never triggers a restart."""
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
-    try:
-        files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
-    except OSError:
-        return None
+    files = _pending_task_files(tasks_dir)
     if not files:
         return None
     try:
