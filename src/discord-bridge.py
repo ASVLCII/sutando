@@ -2727,6 +2727,24 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] bot message without mention in requireMention=true channel", flush=True)
             return
 
+        # Progress-stream placeholder guard: a peer node with
+        # SUTANDO_PROGRESS_STREAM=1 posts "⏳ <step> (Ns)" placeholders (and edits
+        # them) while its own owner task runs. In a requireMention=false channel
+        # where that node sits in allowFrom, the bot-author filter above lets them
+        # through and we'd ingest each placeholder + edit as a fresh task — a
+        # self-inflicted flood. These carry no work for us; drop them regardless
+        # of requireMention. Tight-anchored detector (see progress_stream) so a
+        # real task containing an hourglass emoji is not misclassified.
+        # Scoped to BOT authors (qingyun P1 on #2157). The shape alone is not a
+        # safe discriminator: a human owner/team message whose entire body happens
+        # to read "⏳ deploy the release (9s)" would otherwise be silently dropped
+        # before task creation — a valid human task lost with only a skip log.
+        # Only a peer NODE emits these, so author.bot is the real signal and the
+        # text shape is the secondary filter, not the primary one.
+        if getattr(message.author, "bot", False) and progress_stream.is_progress_placeholder(message.content):
+            print(f"  [skip] progress-stream placeholder from bot {message.author}", flush=True)
+            return
+
         bot_mentioned = client.user in message.mentions
         # role_mentioned counts as "addressed to us" — assumes these roles are held
         # only by this bot; a role shared across sibling bots re-introduces the
