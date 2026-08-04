@@ -90,7 +90,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3350,7 +3350,15 @@ async def _handle_discord_message(message, force=False):
     # bot sees only the new reply text in isolation.
     reply_context = ""
     reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
-    if message.reference and message.reference.message_id:
+    # A forward sets `reference` too, and its target is in the SOURCE channel —
+    # fetching it here is a guaranteed 404 plus a misleading log line. The
+    # forward's body is not lost: the snapshot handler above already extracted
+    # it. (#2633 review: the first version gated only the header.)
+    if should_fetch_reply_context(
+        has_reference=bool(message.reference),
+        has_message_id=bool(message.reference and message.reference.message_id),
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+    ):
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -3829,14 +3837,20 @@ async def _handle_discord_message(message, force=False):
     # line into the task file's k:v shape (per qingyun review on #1077).
     channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
     guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
-    # When this message is a reply, emit the parent's id so the core agent can
+    # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
-    # Discord plugin works (reference by message_id + fetch).
-    parent_msg_line = (
-        f"parent_message_id: {message.reference.message_id}\n"
-        if getattr(message, "reference", None) and message.reference.message_id
-        else ""
+    # Discord plugin works (reference by message_id + fetch). A FORWARD also
+    # carries a reference — pointing into its SOURCE channel — so it is keyed
+    # separately; see `format_parent_reference`.
+    _ref = getattr(message, "reference", None)
+    parent_msg_line = format_parent_reference(
+        getattr(_ref, "message_id", None) if _ref else None,
+        # A forward sets `reference` too, so the key must not be decided by the
+        # reference alone. The snapshot IS the forward — same signal the
+        # forward-handler above already extracts the body from.
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+        source_channel_id=getattr(_ref, "channel_id", None) if _ref else None,
     )
     # Full walked ancestor id spine (root-first) for thread reconstruction —
     # handles to re-fetch any ancestor the inlined chain clipped/dropped past
