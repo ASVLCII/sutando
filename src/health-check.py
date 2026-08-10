@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
@@ -5761,6 +5761,134 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+
+
+def _file_digest(path: Path) -> str:
+    """sha256 of a file, or a sentinel that can never equal another file's digest.
+
+    Read errors must NOT make two files compare equal — that would silently turn an
+    unreadable pair into "identical" and hide the divergence this probe reports.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return f"<unreadable:{path}>"
+
+
+def check_legacy_notes_divergence() -> "dict | None":
+    """Detect a canonical-vs-legacy notes/ divergence the #1266 probe cannot see.
+
+    `check_notes_split_brain` compares <repo>/notes against <workspace>/notes.
+    A host whose repo has no notes/ dir clears that guard and goes quiet, while the
+    pre-v0.8 <legacy workspace>/notes (often a symlink into the memory-sync clone)
+    keeps taking writes. Measured on one host:
+    91 specs canonical, 105 legacy, 83 shared — bidirectional, and the newest
+    canonical spec was 7 days older than the newest legacy one.
+
+    Recursive and extension-agnostic on purpose: the #1266 probe globs top-level
+    `*.md`, and this divergence lives in `sutando-wire/episode-specs/*.yaml`,
+    so an .md-only top-level scan reports clean twice over.
+
+    Reports counts, and NAMES the legacy-only paths — never a "which side is live"
+    verdict. A whole-tree newest-mtime is dominated by whichever file was touched
+    last for any reason: on one host it read "canonical newer by 0.0d" while the
+    subtree that mattered was 7 days older. And a bare ratio invites dismissal —
+    on a second host "2 of 11,442" was first read as nothing to worry about, when
+    those 2 were the files a "delete the legacy tree" cleanup would destroy with
+    no copy anywhere. Legacy-only, not both directions: canonical is the tree the
+    resolver reaches, so a canonical-only file is merely unsynced.
+    """
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    legacy_notes = legacy_dotted_workspace() / "notes"
+    if not ws_notes.exists() or not legacy_notes.exists():
+        return None
+    # A read failure must not read as "no divergence": this warning exists to stop a
+    # cleanup discarding the only copy, so silence is the one unsafe direction.
+    def _unreadable(what: str, exc: OSError) -> "dict":
+        return {
+            "name": "legacy-notes-divergence",
+            "status": "warn",
+            "detail": (
+                f"could not compare the two notes/ trees — {what}: {exc}. This is NOT "
+                f"a clean bill of health: the probe exists to catch legacy-only files "
+                f"that a cleanup would destroy, and it could not read them. Resolve the "
+                f"access error before deleting or repointing either tree "
+                f"(canonical {ws_notes}, legacy {legacy_notes})."
+            ),
+        }
+
+    try:
+        if ws_notes.resolve() == legacy_notes.resolve():
+            return None
+    except OSError as exc:
+        return _unreadable("resolving one of them failed", exc)
+
+    def _rel(root: Path) -> "dict[str, Path] | None":
+        """Map relative path -> file. None means the scan FAILED, never "empty"."""
+        out = {}
+        try:
+            for p in root.rglob("*"):
+                if p.is_file():
+                    out[str(p.relative_to(root))] = p
+        except OSError:
+            return None
+        return out
+
+    a, b = _rel(ws_notes), _rel(legacy_notes)
+    for label, scanned in (("the canonical tree", a), ("the legacy tree", b)):
+        if scanned is None:
+            return _unreadable(f"enumerating {label} failed", OSError("scan incomplete"))
+    only_ws, only_legacy = set(a) - set(b), set(b) - set(a)
+    # A shared PATH is not a shared FILE. Comparing name sets alone reports healthy
+    # when both trees hold the same path with different bytes — measured 57 of 1056.
+    differing = sorted(r for r in (set(a) & set(b)) if _file_digest(a[r]) != _file_digest(b[r]))
+    if not only_ws and not only_legacy and not differing:
+        return None
+
+    ranked = sorted(only_legacy, key=lambda p: (Path(p).name.startswith("."), p))
+    named = ", ".join(ranked[:3])
+    more = f" … and {len(only_legacy) - 3} more" if len(only_legacy) > 3 else ""
+    at_risk = (
+        f" LEGACY-ONLY (no copy in the canonical tree): {named}{more}."
+        if only_legacy else ""
+    )
+    # Derived from the computed sets, never asserted: a hardcoded "neither side is a
+    # superset" is FALSE when one is, and would tell cleanup the opposite of the truth.
+    if only_ws and only_legacy:
+        shape = "Neither side is a superset, so pointing a consumer at either one loses files."
+    elif only_legacy:
+        shape = (f"The legacy tree is a strict superset by name — the canonical one is missing "
+                 f"{len(only_legacy)} file(s).")
+    elif only_ws:
+        shape = (f"The canonical workspace is a strict superset by name — the legacy one is "
+                 f"missing {len(only_ws)} file(s).")
+    else:
+        shape = "Names match on both sides; the divergence is entirely in file CONTENT."
+    content = (
+        f" {len(differing)} shared path(s) differ in CONTENT, so deleting either tree "
+        f"loses bytes even where the names match (e.g. {', '.join(differing[:2])})."
+        if differing else ""
+    )
+    return {
+        "name": "legacy-notes-divergence",
+        "status": "warn",
+        "detail": (
+            f"notes/ has diverged from the pre-v0.8 {legacy_notes}: "
+            f"{len(only_ws)} file(s) only in the canonical workspace, "
+            f"{len(only_legacy)} only in the legacy tree, "
+            f"{len(set(a) & set(b))} shared ({len(differing)} of them differing)."
+            f"{at_risk}{content} {shape} Decide which tree is authoritative before "
+            f"'fixing' any path that reads notes/, and compare the SUBTREE you "
+            f"care about — a whole-tree mtime does not say which side is live."
+        ),
+    }
+
+
 def _drop_launcher_parents(pids: list) -> list:
     """Collapse a launcher+child pair to the child that is the real process.
 
@@ -6954,6 +7082,11 @@ def run_all_checks() -> list[dict]:
     _notes_sb = check_notes_split_brain()
     if _notes_sb:
         checks.append(_notes_sb)
+
+    # Sibling of the above, for the pair it cannot reach (see its docstring).
+    _legacy_nd = check_legacy_notes_divergence()
+    if _legacy_nd:
+        checks.append(_legacy_nd)
 
     # Memory sync
     checks.append(check_memory_sync())
