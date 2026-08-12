@@ -2416,6 +2416,7 @@ intents.message_content = True
 if os.environ.get("DISCORD_GUILD_MEMBERS_INTENT", "").lower() in ("1", "true", "yes"):
     intents.members = True
 client = discord.Client(intents=intents)
+_ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2469,13 +2470,22 @@ _poll_loops_started = False
 
 @client.event
 async def on_ready():
-    print(f"Discord bridge ready: {client.user}", flush=True)
+    global _ready_count
+    _ready_count += 1
     # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
     # was down, auto-restore it from the durable state/auth/ backup BEFORE any
     # access read below. Without this a wipe+restart boots into pairing/TOFU with
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    # Explicit presence: after a reconnect the default presence can lag; setting
+    # it on every ready makes recovery visible immediately instead of waiting
+    # for Discord to infer it. Best-effort — presence must never break startup.
+    try:
+        await client.change_presence(status=discord.Status.online)
+    except Exception:
+        pass
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -3365,7 +3375,11 @@ async def _handle_discord_message(message, force=False):
         try:
             await att.save(local_path)
             attachment_refs.append(_ref_from_attachment(att, local_path))  # pragma: no cover
-            transcript = _transcribe_via_skill(str(local_path))
+            # Off-loop: transcription shells out for up to 25s; run sync on the
+            # event loop it starves the gateway heartbeat (~41s interval) and
+            # Discord drops the socket -> presence flaps offline (owner report
+            # 2026-07-17: 49 fresh gateway sessions in one log window).
+            transcript = await asyncio.to_thread(_transcribe_via_skill, str(local_path))  # pragma: no cover
             if transcript:
                 attachment_note += f"\n[Voice transcript: {transcript}]"
             else:
@@ -5553,7 +5567,10 @@ async def poll_dm_fallback():
                     # `<workspace>/src/dm-result.py` (does not exist) and the
                     # dm-fallback path errored out silently before delivering.
                     _DM_RESULT_SCRIPT = Path(__file__).resolve().parent / "dm-result.py"
-                    result = subprocess.run(
+                    # Off-loop for the same heartbeat-starvation reason as the
+                    # transcribe call in on_message (up to 15s per file here).
+                    result = await asyncio.to_thread(  # pragma: no cover
+                        subprocess.run,
                         [sys.executable, str(_DM_RESULT_SCRIPT), "--file", str(f)],
                         capture_output=True, text=True, timeout=15,
                         stdin=subprocess.DEVNULL,
