@@ -109,7 +109,7 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from result_ready import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
@@ -3140,11 +3140,14 @@ async def _handle_discord_message(message, force=False):
                 getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
                 for u in (getattr(message, "mentions", None) or [])
             )
+            # A forward sets message.reference too but is NOT a reply (its payload is
+            # in message_snapshots); classing it as one makes this gate skip forwards.
+            _is_reply = reference_is_reply(_ref is not None, getattr(_ref, "type", None))
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
-                is_reply=_ref is not None,
+                is_reply=_is_reply,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=_self_id,
                 author_id=getattr(message.author, "id", None),
