@@ -261,6 +261,74 @@ pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex result\\n')
         assert (workspace / "results" / team.name).read_text() == "safe codex result\n"
 
 
+def test_provider_launches_do_not_inherit_an_open_parent_fifo() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        project = root / "project"
+        results = workspace / "results"
+        project.mkdir()
+        results.mkdir(parents=True)
+        team = _task(workspace, "task-team-open-fifo", "team")
+        claude_owner = _task(workspace, "task-claude-open-fifo")
+        codex_owner = _task(workspace, "task-codex-open-fifo")
+        _store(workspace, {
+            claude_owner.stem: {"workstream_id": "workstream-a"},
+            codex_owner.stem: {"workstream_id": "workstream-a"},
+        })
+        _executable(root / "codex", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+assert sys.stdin.read() == ''
+args = sys.argv[1:]
+pathlib.Path(args[args.index('-o') + 1]).write_text('safe codex fifo result\\n')
+print(json.dumps({'type': 'thread.started',
+                  'thread_id': '12345678-1234-1234-8234-123456789abc'}))
+""")
+        _executable(root / "claude", """#!/usr/bin/env python3
+import sys
+assert sys.stdin.read() == ''
+print('safe claude fifo result')
+""")
+
+        for runtime, task, expected in (
+            ("codex", team, "safe codex fifo result\n"),
+            ("claude", claude_owner, "safe claude fifo result\n"),
+            ("codex", codex_owner, "safe codex fifo result\n"),
+        ):
+            fifo = root / f"{task.stem}-events"
+            os.mkfifo(fifo)
+            fifo_fd = os.open(fifo, os.O_RDWR)
+            process = subprocess.Popen(
+                [
+                    sys.executable, str(WORKER), "--runtime", runtime,
+                    "--workspace", str(workspace), "--task-file", str(task),
+                    "--results-dir", str(results), "--repo", str(REPO),
+                ],
+                cwd=REPO,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "SUTANDO_ISOLATED_WORKING_DIR": str(project),
+                    "SUTANDO_TIER_HARD_TIMEOUT": "5",
+                    "SUTANDO_TIER_STALL_TIMEOUT": "3",
+                },
+                stdin=fifo_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                os.close(fifo_fd)
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=2)
+            assert process.returncode == 0, (runtime, task.name, stdout, stderr)
+            assert (results / task.name).read_text() == expected
+
+
 def test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1664,6 +1732,7 @@ if __name__ == "__main__":
     test_tier_parser_prevents_task_body_escalation_and_fails_closed()
     test_team_claude_uses_normal_workspace_with_guardrail_and_output_scan()
     test_team_codex_uses_normal_workspace_and_owner_configuration()
+    test_provider_launches_do_not_inherit_an_open_parent_fifo()
     test_ag2space_team_room_setting_runs_bridge_to_guarded_runtime_end_to_end()
     test_bounded_runtime_failure_never_falls_back_to_owner_core()
     test_stalled_team_runtime_is_killed_and_publishes_safe_result()
