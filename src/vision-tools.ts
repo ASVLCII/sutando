@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readCaptureToken } from './util_paths.js';
 import { findRepoRoot } from './sutando_config.js';
+import { readBodyCapped } from './http-body-limit.js';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
@@ -1093,15 +1094,15 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 			return respond(200, stopStreaming());
 		}
 		if (url.pathname === '/vision/frame' && req.method === 'POST') {
-			const chunks: Buffer[] = [];
-			req.on('data', (c: Buffer) => chunks.push(c));
-			req.on('end', () => {
-				const buf = Buffer.concat(chunks);
+			// Cap the body BEFORE buffering it. The egress gate rejects an
+			// oversized frame, but only after the whole request is already in
+			// memory — and this listener binds 0.0.0.0 by default.
+			void readBodyCapped(req).then((buf) => {
+				if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
 				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
 			});
-			req.on('error', () => respond(500, { status: 'failed', error: 'request error' }));
 			return;
 		}
 		respond(404, { error: 'not found' });
