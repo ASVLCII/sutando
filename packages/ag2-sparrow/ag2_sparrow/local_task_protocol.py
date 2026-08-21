@@ -145,6 +145,9 @@ KNOWN_HEADER_KEYS = (
     # non-addressed core can tell; header status defangs a forged body copy.
     "receiving_instance",
     "from", "call_sid", "hint", "instructions", "transcript",
+    # Durable schedule identity (#2723): the codex scheduler stamps which
+    # schedule and which slot produced the task.
+    "schedule_name", "schedule_slot",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
     # here promotes them to headers AND (via the guard's shared import) defangs
     # them in untrusted bodies, so a forged `attachments:` body line can never
