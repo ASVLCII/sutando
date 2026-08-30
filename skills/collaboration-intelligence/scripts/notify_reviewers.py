@@ -60,6 +60,19 @@ def load_roster() -> dict:
     return data
 
 
+def stated_reason(entry: dict) -> str:
+    """The roster's own words for why an entry refuses, if it gave any.
+
+    A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
+    entry knows which, and a refusal that omits it invites the repair that
+    overrides it (#3468)."""
+    for key in ("refusal_basis", "note"):
+        v = entry.get(key)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())
+    return ""
+
+
 def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     """(targets, refusal_rc): one bad entry must never starve the rest of the
     batch — resolvable reviewers are still notified, the worst refusal code
@@ -73,15 +86,23 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 2)
             continue
         stand, room = entry.get("stand"), entry.get("room")
+        why = stated_reason(entry)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
                   f"(human-only = not Stand addressing)", file=sys.stderr)
+            # Without this the refusal reads as a data gap, and the obvious
+            # repair — populate the fields — silently overrides the refusal.
+            if why:
+                print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            print(f"OFF-ALLOWLIST '{name}': {stand} bounced a mention before —"
-                  " route through the owner instead of re-sending",
+            # State the FLAG, never a cause: nothing sets allowlisted=False after
+            # a detected bounce, so any history claim here would be a guess.
+            print(f"OFF-ALLOWLIST '{name}': {stand} is not allowlisted for mentions"
+                  + (f" — {why}" if why else "")
+                  + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
